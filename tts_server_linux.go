@@ -6,7 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -22,7 +22,20 @@ import (
 	"github.com/gorilla/mux"
 )
 
-// TTSServResponse response from backend srvs
+const (
+	DEFAULT_PORT               = "8080"
+	DEFAULT_TIMEOUT            = 30 * time.Second
+	MAX_TEXT_LENGTH            = 5000
+	MIN_SPEED                  = 0.25
+	MAX_SPEED                  = 4.0
+	DEFAULT_SPEED              = 1.0
+	MAX_REQUEST_BODY_SIZE      = 1024 * 1024
+	RATE_LIMIT_REQUESTS        = 100
+	RATE_LIMIT_WINDOW          = time.Minute
+	MAX_RESPONSE_TIMES         = 100
+	MAX_ERRORS                 = 10
+)
+
 type TTSServResponse struct {
 	ReqID     string `json:"reqid"`
 	Code      int    `json:"code"`
@@ -32,7 +45,6 @@ type TTSServResponse struct {
 	Data      string `json:"data"`
 }
 
-// OpenAI TTS API请求格式
 type OpenAITTSRequest struct {
 	Model          string  `json:"model"`
 	Input          string  `json:"input"`
@@ -41,7 +53,6 @@ type OpenAITTSRequest struct {
 	Speed          float64 `json:"speed,omitempty"`
 }
 
-// 字节跳动TTS配置
 type ByteDanceTTSConfig struct {
 	AppID       string
 	BearerToken string
@@ -49,78 +60,119 @@ type ByteDanceTTSConfig struct {
 	URL         string
 	VoiceType   string
 	Timeout     time.Duration
+
+
+type RateLimiter struct {
+	requests  map[string][]time.Time
+	mutex     sync.Mutex
+	limit     int
+
+	}
+
+type Stats struct {
+	totalRequests       int64
+successfulRequests  int64
+	failedRequests      int64
+	totalResponseTime   time.Duration
+	recentResponseTimes []float64
+	responseTimesIndex  int
+lastErrors          []string
+	errorsIndex         int
+	mutex               sync.RWMutex
 }
 
-// API密钥配置
-var VALID_API_KEY string
+ar (
+	VALID_API_KEYS    []string
+	ttsConfig         ByteDanceTTSConfig
+	globalHTTPClient  *http.Client
+	apiStats          *Stats
+ateLimiter       *RateLimiter
+)
 
-// 全局配置
-var ttsConfig ByteDanceTTSConfig
+func init() {
+	globalHTTPClient = &http.Client{
+		Timeout: DEFAULT_TIMEOUT,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
+	}
 
-// 初始化字节跳动TTS配置
-func initTTSConfig() {
-	missingVars := []string{}
+	apiStats = &Stats{
+	recentResponseTimes: make([]float64, MAX_RESPONSE_TIMES),
+		lastErrors:          make([]string, MAX_ERRORS),
+	}
+
+	rateLimiter = &RateLimiter{
+		requests: make(map[string][]time.Time),
+		limit:    RATE_LIMIT_REQUESTS,
+		window:   RATE_LIMIT_WINDOW,
 	
-	// 读取必须的环境变量
-	appID := os.Getenv("BYTEDANCE_TTS_APP_ID")
+}
+
+func (rl *RateLimiter) Allow(key string) bool {
+	rl.mutex.Lock()
+	defer rl.mutex.Unlock()
+
+	now := time.Now()
+	cutoff := now.Add(-rl.window)
+
+timestamps := rl.requests[key]
+	valid := make([]time.Time, 0, len(timestamps))
+	for _, ts := range timestamps {
+		if ts.After(cutoff) {
+			valid = append(valid, ts)
+		}
+	}
+
+	if len(valid) >= rl.limit {
+		rl.requests[key] = valid
+		return false
+	}
+
+	valid = append(valid, now)
+	rl.requests[key] = valid
+	return true
+}
+
+func initTTSConfig() error  {
+	appID := os.Getenv("BYTEDANC E_TTS_APP_ID")
+	bearerToken := os.Getenv("BYTEDANCE_TTS_BEARER_TOKEN")
+cluster := os.Getenv("BYTEDANCE_TTS_CLUSTER")
+	voiceType := os.Getenv("BYTEDANCE_TTS_VOICE_TYPE")
+
+	missingVars := []string{}
 	if appID == "" {
 		missingVars = append(missingVars, "BYTEDANCE_TTS_APP_ID")
 	}
-	
-bearerToken := os.Getenv("BYTEDANCE_TTS_BEARER_TOKEN")
-	if bearerToken == "" {
+if bearerToken == "" {
 		missingVars = append(missingVars, "BYTEDANCE_TTS_BEARER_TOKEN")
 	}
-	
-	cluster := os.Getenv("BYTEDANCE_TTS_CLUSTER")
 	if cluster == "" {
 		missingVars = append(missingVars, "BYTEDANCE_TTS_CLUSTER")
 	}
-	
-	voiceType := os.Getenv("BYTEDANCE_TTS_VOICE_TYPE")
 	if voiceType == "" {
 		missingVars = append(missingVars, "BYTEDANCE_TTS_VOICE_TYPE")
-	}
-	
-	// 如果有缺失的必须变量，输出错误信息并使用默认值继续运行（但可能会导致功能失败）
+}
+
 	if len(missingVars) > 0 {
-		log.Printf("警告: 缺少以下必须的环境变量: %v", missingVars)
-		log.Printf("请设置这些环境变量以确保服务正常工作")
-		
-		// 使用默认值以便服务能够启动
-		if appID == "" {
-			appID = "8877631864"
-		}
-		if bearerToken == "" {
-			bearerToken = "IZFPVWC5rVIoR5vRYyc21BdJI0qNanse"
-		}
-		if cluster == "" {
-			cluster = "volcano_icl"
-		}
-		if voiceType == "" {
-			voiceType = "S_JuVo3sao1"
-		}
+		return fmt.Errorf("缺少必需的环境变量: %v", missingVars)
 	}
-	
-	// 读取可选的环境变量，使用默认值如果未设置
-	url := os.Getenv("BYTEDANCE_TTS_ENDPOINT")
+ 
+	url := os.Getenv( "BYTEDANCE_TTS_ENDPOINT")
 	if url == "" {
-		url = "https://openspeech.bytedance.com/api/v1/tts"
-	} else {
-		log.Printf("使用自定义字节跳动TTS端点: %s", url)
-	}
-		timeoutStr := os.Getenv("BYTEDANCE_TTS_TIMEOUT")
-	timeout := 30 * time.Second
-	if timeoutStr != "" {
+	
+	timeout := DEFAULT_TIMEOUT
+	if timeoutStr := os.Getenv("BYTEDANCE_TTS_TIMEOUT"); timeoutStr != "" {
 		if parsedTimeout, err := time.ParseDuration(timeoutStr); err == nil {
 			timeout = parsedTimeout
-			log.Printf("使用自定义超时设置: %v", timeout)
 		} else {
-			log.Printf("无效的超时设置 '%s'，使用默认值30s", timeoutStr)
+			log.Printf("无效的超时设置 '%s'，使用默认值: %v", timeoutStr, timeout)
 		}
 	}
-	
-	// 设置配置
+
 	ttsConfig = ByteDanceTTSConfig{
 		AppID:       appID,
 		BearerToken: bearerToken,
@@ -129,48 +181,54 @@ bearerToken := os.Getenv("BYTEDANCE_TTS_BEARER_TOKEN")
 		VoiceType:   voiceType,
 		Timeout:     timeout,
 	}
+
+	return nil
 }
 
-// 检查环境变量配置状态
+func initAPIKeys() {
+	apiKey := os.Getenv("OPENAI_TTS_API_KEY")
+	if apiKey != "" {
+		VALID_API_KEYS = strings.Split(apiKey, ",")
+		for i, k := range VALID_API_KEYS {
+			VALID_API_KEYS[i] = strings.TrimSpace(k)
+		}
+		log.Printf("已配置 %d 个有效的API密钥", len(VALID_API_KEYS))
+	} else {
+		log.Println("警告: OPENAI_TTS_API_KEY 环境变量未设置，将允许所有请求")
+	}
+}
+
 func checkEnvironmentVariables() map[string]interface{} {
-	// 检查必要的环境变量是否已设置
 	requiredVars := map[string]bool{
 		"BYTEDANCE_TTS_APP_ID":       os.Getenv("BYTEDANCE_TTS_APP_ID") != "",
 		"BYTEDANCE_TTS_BEARER_TOKEN": os.Getenv("BYTEDANCE_TTS_BEARER_TOKEN") != "",
-		"BYTEDANCE_TTS_CLUSTER":     os.Getenv("BYTEDANCE_TTS_CLUSTER") != "",
-		"BYTEDANCE_TTS_VOICE_TYPE":  os.Getenv("BYTEDANCE_TTS_VOICE_TYPE") != "",
+		"BYTEDANCE_TTS_CLUSTER":      os.Getenv("BYTEDANCE_TTS_CLUSTER") != "",
+		"BYTEDANCE_TTS_VOICE_TYPE":   os.Getenv("BYTEDANCE_TTS_VOICE_TYPE") != "",
 	}
-	
+
 	missingVars := []string{}
 	for varName, isSet := range requiredVars {
 		if !isSet {
 			missingVars = append(missingVars, varName)
 		}
 	}
-	
-	// 检查可选的环境变量是否已设置
+
 	optionalVars := map[string]bool{
 		"BYTEDANCE_TTS_ENDPOINT": os.Getenv("BYTEDANCE_TTS_ENDPOINT") != "",
 		"BYTEDANCE_TTS_TIMEOUT":  os.Getenv("BYTEDANCE_TTS_TIMEOUT") != "",
 		"OPENAI_TTS_API_KEY":     os.Getenv("OPENAI_TTS_API_KEY") != "",
 		"PORT":                   os.Getenv("PORT") != "",
 	}
-	
-	// 构建配置状态响应
+
 	return map[string]interface{}{
 		"all_required_vars_set": len(missingVars) == 0,
 		"missing_required_vars": missingVars,
-		"required_vars":        requiredVars, // 只显示是否设置，不显示具体值
-		"optional_vars":        optionalVars, // 只显示是否设置，不显示具体值
+		"required_vars_set":     requiredVars,
+		"optional_vars_set":     optionalVars,
 	}
 }
 
-
-
 func httpPost(url string, headers map[string]string, body []byte, timeout time.Duration) ([]byte, error) {
-	client := &http.Client{
-		Timeout: timeout,
-	}
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(body))
 	if err != nil {
 		return nil, err
@@ -178,16 +236,23 @@ func httpPost(url string, headers map[string]string, body []byte, timeout time.D
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
+
+	client := globalHTTPClient
+	if timeout != 0 && timeout != ttsConfig.Timeout {
+		client = &http.Client{Timeout: timeout}
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	retBody, err := ioutil.ReadAll(resp.Body)
+
+	retBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-	return retBody, err
+	return retBody, nil
 }
 
 func synthesis(text string, speed float64) ([]byte, error) {
@@ -204,11 +269,6 @@ func synthesis(text string, speed float64) ([]byte, error) {
 	params["audio"] = make(map[string]interface{})
 	params["audio"]["voice_type"] = ttsConfig.VoiceType
 	params["audio"]["encoding"] = "wav"
-
-	// 处理语速参数
-	if speed <= 0 {
-		speed = 1.0
-	}
 	params["audio"]["speed_ratio"] = speed
 	params["audio"]["volume_ratio"] = 1.0
 	params["audio"]["pitch_ratio"] = 1.0
@@ -223,64 +283,88 @@ func synthesis(text string, speed float64) ([]byte, error) {
 	headers["Content-Type"] = "application/json"
 	headers["Authorization"] = fmt.Sprintf("Bearer;%s", ttsConfig.BearerToken)
 
-	bodyStr, _ := json.Marshal(params)
-	synResp, err := httpPost(ttsConfig.URL, headers, []byte(bodyStr), ttsConfig.Timeout)
+	bodyStr, err := json.Marshal(params)
 	if err != nil {
-		log.Printf("http post fail [err:%s]\n", err.Error())
+		log.Printf("JSON marshal fail: %v", err)
+		return nil, err
+	}
+
+	synResp, err := httpPost(ttsConfig.URL, headers, bodyStr, ttsConfig.Timeout)
+	if err != nil {
+		log.Printf("http post fail: %v", err)
 		return nil, err
 	}
 
 	var respJSON TTSServResponse
 	err = json.Unmarshal(synResp, &respJSON)
 	if err != nil {
-		log.Printf("unmarshal response fail [err:%s]\n", err.Error())
+		log.Printf("unmarshal response fail: %v", err)
 		return nil, err
 	}
 
 	if respJSON.Code != 3000 {
-		log.Printf("code fail [code:%d, message:%s]\n", respJSON.Code, respJSON.Message)
-		return nil, fmt.Errorf("TTS service error: code %d, message: %s", respJSON.Code, respJSON.Message)
+		log.Printf("TTS service error: code=%d, message=%s", respJSON.Code, respJSON.Message)
+		return nil, fmt.Errorf("TTS service error")
 	}
 
 	audio, err := base64.StdEncoding.DecodeString(respJSON.Data)
 	if err != nil {
-		log.Printf("base64 decode fail [err:%s]\n", err.Error())
+		log.Printf("base64 decode fail: %v", err)
 		return nil, err
 	}
 	return audio, nil
 }
 
-// 验证API密钥
 func validateAPIKey(r *http.Request) bool {
-	// 当VALID_API_KEY为空时，允许任何API密钥通过验证
-	if VALID_API_KEY == "" {
+	if len(VALID_API_KEYS) == 0 {
 		return true
 	}
 
-	// 从 Authorization header 中获取 Bearer token
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
 		return false
 	}
 
-	// 检查是否以 "Bearer " 开头
 	if !strings.HasPrefix(authHeader, "Bearer ") {
 		return false
 	}
 
-	// 提取token
 	token := strings.TrimPrefix(authHeader, "Bearer ")
-	return token == VALID_API_KEY
+	for _, validKey := range VALID_API_KEYS {
+		if token == validKey {
+			return true
+		}
+	}
+	return false
 }
 
-// OpenAI TTS API兼容端点
+func getClientIP(r *http.Request) string {
+	xForwardedFor := r.Header.Get("X-Forwarded-For")
+	if xForwardedFor != "" {
+		ips := strings.Split(xForwardedFor, ",")
+		if len(ips) > 0 {
+			return strings.TrimSpace(ips[0])
+		}
+	}
+
+	xRealIP := r.Header.Get("X-Real-IP")
+	if xRealIP != "" {
+		return xRealIP
+	}
+
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 func openaiTTSHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// 验证API密钥
 	if !validateAPIKey(r) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
@@ -294,8 +378,28 @@ func openaiTTSHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	clientIP := getClientIP(r)
+	if !rateLimiter.Allow(clientIP) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": "Rate limit exceeded. Please try again later.",
+				"type":    "rate_limit_error",
+				"code":    "rate_limit_exceeded",
+			},
+		})
+		return
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MAX_REQUEST_BODY_SIZE))
+	if err != nil {
+		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
 	var req OpenAITTSRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
@@ -305,55 +409,40 @@ func openaiTTSHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 设置默认语速
-	speed := req.Speed
-	if speed <= 0 {
-		speed = 1.0
+	if len(req.Input) > MAX_TEXT_LENGTH {
+		http.Error(w, fmt.Sprintf("Input text too long (max %d characters)", MAX_TEXT_LENGTH), http.StatusBadRequest)
+		return
 	}
 
-	// 调用字节跳动TTS
+	speed := req.Speed
+	if speed <= 0 {
+		speed = DEFAULT_SPEED
+	}
+	if speed < MIN_SPEED {
+		speed = MIN_SPEED
+	}
+	if speed > MAX_SPEED {
+		speed = MAX_SPEED
+	}
+
 	ttsStart := time.Now()
 	audioData, err := synthesis(req.Input, speed)
-	// 记录TTS处理时间
-	_ = time.Since(ttsStart)
+	duration := time.Since(ttsStart)
 
 	if err != nil {
-		log.Printf("TTS synthesis failed: %v", err)
+		addRequestStats(false, duration, err.Error())
 		http.Error(w, "TTS synthesis failed", http.StatusInternalServerError)
 		return
 	}
 
-	// 设置响应头
+	addRequestStats(true, duration, "")
+
 	w.Header().Set("Content-Type", "audio/wav")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(audioData)))
-
-	// 返回音频数据
 	w.WriteHeader(http.StatusOK)
 	w.Write(audioData)
 }
 
-// 统计数据结构体
-type Stats struct {
-	totalRequests       int64
-	successfulRequests  int64
-	failedRequests      int64
-	totalResponseTime   time.Duration
-	recentResponseTimes []float64
-	maxRecentResponses  int
-	lastErrors          []string
-	maxLastErrors       int
-	mutex               sync.RWMutex
-}
-
-// API调用统计
-var apiStats = &Stats{
-	recentResponseTimes: make([]float64, 0, 100),
-	maxRecentResponses:  100,
-	lastErrors:          make([]string, 0, 10),
-	maxLastErrors:       10,
-}
-
-// 添加请求统计
 func addRequestStats(success bool, responseTime time.Duration, errMsg string) {
 	apiStats.mutex.Lock()
 	defer apiStats.mutex.Unlock()
@@ -361,130 +450,94 @@ func addRequestStats(success bool, responseTime time.Duration, errMsg string) {
 	apiStats.totalRequests++
 	apiStats.totalResponseTime += responseTime
 
-	// 添加到最近响应时间数组
-	apiStats.recentResponseTimes = append(apiStats.recentResponseTimes, responseTime.Seconds()*1000) // 转换为毫秒
-	if len(apiStats.recentResponseTimes) > apiStats.maxRecentResponses {
-		apiStats.recentResponseTimes = apiStats.recentResponseTimes[1:]
-	}
+	apiStats.recentResponseTimes[apiStats.responseTimesIndex] = responseTime.Seconds() * 1000
+	apiStats.responseTimesIndex = (apiStats.responseTimesIndex + 1) % MAX_RESPONSE_TIMES
 
-	if success {
+if success {
 		apiStats.successfulRequests++
 	} else {
 		apiStats.failedRequests++
-		// 添加到最近错误数组
 		if errMsg != "" {
 			errInfo := fmt.Sprintf("%s: %s", time.Now().Format(time.RFC3339), errMsg)
-			apiStats.lastErrors = append(apiStats.lastErrors, errInfo)
-			if len(apiStats.lastErrors) > apiStats.maxLastErrors {
-				apiStats.lastErrors = apiStats.lastErrors[1:]
-			}
+			apiStats.lastErrors[apiStats.errorsIndex] = errInfo
+			apiStats.errorsIndex = (apiStats.errorsIndex + 1) % MAX_ERRORS
 		}
 	}
 }
 
-// 获取内存信息
-func getMemoryInfo() map[string]uint64 {
+func getMemoryInfo() map[string]interface{} {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-	return map[string]uint64{
-		"total":      m.Sys,
-		"allocated":  m.Alloc,
-		"available":  m.Sys - m.Alloc,
-		"goroutines": uint64(runtime.NumGoroutine()),
-	}
-}
-
-// 获取网络信息
-func getNetworkInfo() map[string]interface{} {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return map[string]interface{}{
-			"error": err.Error(),
-		}
-	}
-
-	interfaces := make([]map[string]interface{}, 0, len(ifaces))
-	for _, iface := range ifaces {
-		addrs, _ := iface.Addrs()
-		addresses := make([]string, 0, len(addrs))
-		for _, addr := range addrs {
-			addresses = append(addresses, addr.String())
-		}
-		interfaces = append(interfaces, map[string]interface{}{
-			"name":      iface.Name,
-			"mac":       iface.HardwareAddr.String(),
-			"addresses": addresses,
-			"up":        (iface.Flags & net.FlagUp) != 0,
-		})
-	}
-
 	return map[string]interface{}{
-		"interfaces": interfaces,
+		"total_alloc":   m.TotalAlloc,
+		"heap_alloc":    m.HeapAlloc,
+		"heap_inuse":    m.HeapInuse,
+		"goroutines":    runtime.NumGoroutine(),
 	}
 }
 
-// 健康检查端点
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 
-	// 收集统计数据
 	apiStats.mutex.RLock()
 	totalRequests := apiStats.totalRequests
 	successfulRequests := apiStats.successfulRequests
 	failedRequests := apiStats.failedRequests
 	totalResponseTime := apiStats.totalResponseTime
-	recentResponseTimes := make([]float64, len(apiStats.recentResponseTimes))
-	copy(recentResponseTimes, apiStats.recentResponseTimes)
-	lastErrors := make([]string, len(apiStats.lastErrors))
-	copy(lastErrors, apiStats.lastErrors)
+	recentResponseTimes := make([]float64, 0, MAX_RESPONSE_TIMES)
+	for _, t := range apiStats.recentResponseTimes {
+		if t > 0 {
+			recentResponseTimes = append(recentResponseTimes, t)
+		}
+	}
+	lastErrors := make([]string, 0, MAX_ERRORS)
+	for _, e := range apiStats.lastErrors {
+		if e != "" {
+			lastErrors = append(lastErrors, e)
+		}
+	}
 	apiStats.mutex.RUnlock()
 
-	// 计算错误率
 	var errorRate float64
 	if totalRequests > 0 {
 		errorRate = float64(failedRequests) / float64(totalRequests) * 100
 	}
 
-	// 计算平均响应时间
 	var avgResponseTime float64
 	if totalRequests > 0 {
-		avgResponseTime = totalResponseTime.Seconds() * 1000 / float64(totalRequests) // 毫秒
+		avgResponseTime = totalResponseTime.Seconds() * 1000 / float64(totalRequests)
 	}
 
-	// 检查环境变量配置
-	envCheckStatus := checkEnvironmentVariables()
+envCheckStatus := checkEnvironmentVariables()
 	allEnvVarsSet := envCheckStatus["all_required_vars_set"].(bool)
-	
-	// 确定服务状态
+
 	status := "ok"
 	if !allEnvVarsSet {
 		status = "configuration_error"
 	}
 
-	// 构建响应
 	response := map[string]interface{}{
 		"status":     status,
 		"service":    "ByteDance TTS to OpenAI API Adapter",
-		"version":    "1.0.0",
+		"version":    "1.1.0",
 		"uptime":     fmt.Sprintf("%.0f seconds", time.Since(startTime).Seconds()),
 		"start_time": startTime.Format(time.RFC3339),
-		"pid":        os.Getpid(),
 		"memory":     getMemoryInfo(),
-		"network":    getNetworkInfo(),
 		"api_stats": map[string]interface{}{
-			"total_requests":           totalRequests,
-			"successful_requests":      successfulRequests,
-			"failed_requests":          failedRequests,
-			"error_rate":               fmt.Sprintf("%.2f%%", errorRate),
-			"avg_response_time_ms":     fmt.Sprintf("%.2f", avgResponseTime),
+			"total_requests":          totalRequests,
+			"successful_requests":     successfulRequests,
+			"failed_requests":         failedRequests,
+			"error_rate_percent":      fmt.Sprintf("%.2f", errorRate),
+			"avg_response_time_ms":    fmt.Sprintf("%.2f", avgResponseTime),
 			"recent_response_times_ms": recentResponseTimes,
-			"concurrent_requests":      runtime.NumGoroutine() - 1, // 减去健康检查本身的goroutine
 		},
 		"errors": map[string]interface{}{
-			"recent_errors": lastErrors,
+			"recent_errors_count": len(lastErrors),
 		},
-		"config_status": envCheckStatus,
+		"config_status": map[string]interface{}{
+			"all_required_vars_set": allEnvVarsSet,
+		},
 	}
 
 	json.NewEncoder(w).Encode(response)
@@ -492,7 +545,6 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 var startTime time.Time
 
-// 自定义ResponseWriter以捕获状态码
 type statusRecorder struct {
 	http.ResponseWriter
 	statusCode int
@@ -503,28 +555,39 @@ func (rec *statusRecorder) WriteHeader(code int) {
 	rec.ResponseWriter.WriteHeader(code)
 }
 
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	startTime = time.Now()
 
-	// 从环境变量读取API密钥，当环境变量未设置时，设为空字符串（允许任意key）
-	VALID_API_KEY = os.Getenv("OPENAI_TTS_API_KEY")
-	if VALID_API_KEY == "" {
-		log.Println("Warning: OPENAI_TTS_API_KEY environment variable not set. All API keys will be accepted.")
-	}
-	
-	// 初始化字节跳动TTS配置
-	initTTSConfig()
-
-	// 设置日志格式
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.SetPrefix("[TTS-Server] ")
 
+	initAPIKeys()
+
+	if err := initTTSConfig(); err != nil {
+		log.Fatalf("配置初始化失败: %v", err)
+	}
+
 	router := mux.NewRouter()
 
-	// 添加中间件：请求日志和统计
+	router.Use(corsMiddleware)
+
 	router.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// 跳过健康检查的统计，避免递归
 			if r.URL.Path == "/health" {
 				start := time.Now()
 				next.ServeHTTP(w, r)
@@ -537,69 +600,48 @@ func main() {
 			next.ServeHTTP(rec, r)
 			duration := time.Since(start)
 
-			// 记录日志
 			log.Printf("%s %s %s %d %v", r.Method, r.RequestURI, r.RemoteAddr, rec.statusCode, duration)
-
-			// 更新统计
-			success := rec.statusCode >= 200 && rec.statusCode < 400
-			errMsg := ""
-			if !success {
-				errMsg = fmt.Sprintf("HTTP %d", rec.statusCode)
-			}
-			addRequestStats(success, duration, errMsg)
 		})
 	})
 
-	// OpenAI TTS API兼容端点
-	router.HandleFunc("/v1/audio/speech", openaiTTSHandler).Methods("POST")
-
-	// 健康检查
+	router.HandleFunc("/v1/audio/speech", openaiTTSHandler).Methods("POST", "OPTIONS")
 	router.HandleFunc("/health", healthHandler).Methods("GET")
-
-	// 根路径重定向到健康检查
 	router.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/health", http.StatusFound)
 	}).Methods("GET")
 
-	port := ":8080"
-	// 从环境变量获取端口配置
-	if envPort := os.Getenv("PORT"); envPort != "" {
-		port = ":" + envPort
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = DEFAULT_PORT
 	}
 
 	server := &http.Server{
-		Addr:         port,
+		Addr:         ":" + port,
 		Handler:      router,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// 创建一个通道来接收系统信号
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
-	// 在goroutine中启动服务器
 	go func() {
 		log.Printf("Starting ByteDance TTS to OpenAI API adapter server on port %s", port)
-		log.Printf("OpenAI TTS endpoint: http://localhost%s/v1/audio/speech", port)
-		log.Printf("Health check: http://localhost%s/health", port)
-		log.Printf("PID: %d", os.Getpid())
+		log.Printf("OpenAI TTS endpoint: http://localhost:%s/v1/audio/speech", port)
+		log.Printf("Health check: http://localhost:%s/health", port)
 
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed to start: %v", err)
 		}
 	}()
 
-	// 等待信号
 	<-quit
 	log.Println("Shutting down server...")
 
-	// 创建一个5秒的超时上下文
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// 优雅关闭服务器
 	if err := server.Shutdown(ctx); err != nil {
 		log.Printf("Server forced to shutdown: %v", err)
 	} else {
