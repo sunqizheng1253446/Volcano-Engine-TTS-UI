@@ -9,7 +9,7 @@ export GOPROXY=https://goproxy.cn,direct
 # 项目目录 - 自动获取当前目录
 PROJECT_DIR=$(pwd)
 BINARY_NAME="tts-server"
-MAIN_FILE="tts_server_linux.go"
+MAIN_FILE="tts_server.go"
 PID_FILE="$PROJECT_DIR/tts-server.pid"
 LOG_FILE="$PROJECT_DIR/logs/tts-server.log"
 

@@ -23,17 +23,17 @@ import (
 )
 
 const (
-	DEFAULT_PORT               = "8080"
-	DEFAULT_TIMEOUT            = 30 * time.Second
-	MAX_TEXT_LENGTH            = 5000
-	MIN_SPEED                  = 0.25
-	MAX_SPEED                  = 4.0
-	DEFAULT_SPEED              = 1.0
-	MAX_REQUEST_BODY_SIZE      = 1024 * 1024
-	RATE_LIMIT_REQUESTS        = 100
-	RATE_LIMIT_WINDOW          = time.Minute
-	MAX_RESPONSE_TIMES         = 100
-	MAX_ERRORS                 = 10
+	DEFAULT_PORT          = "8080"
+	DEFAULT_TIMEOUT       = 30 * time.Second
+	MAX_TEXT_LENGTH       = 5000
+	MIN_SPEED             = 0.25
+	MAX_SPEED             = 4.0
+	DEFAULT_SPEED         = 1.0
+	MAX_REQUEST_BODY_SIZE = 1024 * 1024
+	RATE_LIMIT_REQUESTS   = 100
+	RATE_LIMIT_WINDOW     = time.Minute
+	MAX_RESPONSE_TIMES    = 100
+	MAX_ERRORS            = 10
 )
 
 type TTSServResponse struct {
@@ -60,33 +60,33 @@ type ByteDanceTTSConfig struct {
 	URL         string
 	VoiceType   string
 	Timeout     time.Duration
-
+}
 
 type RateLimiter struct {
-	requests  map[string][]time.Time
-	mutex     sync.Mutex
-	limit     int
-
-	}
+	requests map[string][]time.Time
+	mutex    sync.Mutex
+	limit    int
+	window   time.Duration
+}
 
 type Stats struct {
 	totalRequests       int64
-successfulRequests  int64
+	successfulRequests  int64
 	failedRequests      int64
 	totalResponseTime   time.Duration
 	recentResponseTimes []float64
 	responseTimesIndex  int
-lastErrors          []string
+	lastErrors          []string
 	errorsIndex         int
 	mutex               sync.RWMutex
 }
 
-ar (
-	VALID_API_KEYS    []string
-	ttsConfig         ByteDanceTTSConfig
-	globalHTTPClient  *http.Client
-	apiStats          *Stats
-ateLimiter       *RateLimiter
+var (
+	VALID_API_KEYS   []string
+	ttsConfig        ByteDanceTTSConfig
+	globalHTTPClient *http.Client
+	apiStats         *Stats
+	rateLimiter      *RateLimiter
 )
 
 func init() {
@@ -101,7 +101,7 @@ func init() {
 	}
 
 	apiStats = &Stats{
-	recentResponseTimes: make([]float64, MAX_RESPONSE_TIMES),
+		recentResponseTimes: make([]float64, MAX_RESPONSE_TIMES),
 		lastErrors:          make([]string, MAX_ERRORS),
 	}
 
@@ -109,7 +109,7 @@ func init() {
 		requests: make(map[string][]time.Time),
 		limit:    RATE_LIMIT_REQUESTS,
 		window:   RATE_LIMIT_WINDOW,
-	
+	}
 }
 
 func (rl *RateLimiter) Allow(key string) bool {
@@ -119,7 +119,7 @@ func (rl *RateLimiter) Allow(key string) bool {
 	now := time.Now()
 	cutoff := now.Add(-rl.window)
 
-timestamps := rl.requests[key]
+	timestamps := rl.requests[key]
 	valid := make([]time.Time, 0, len(timestamps))
 	for _, ts := range timestamps {
 		if ts.After(cutoff) {
@@ -137,17 +137,17 @@ timestamps := rl.requests[key]
 	return true
 }
 
-func initTTSConfig() error  {
-	appID := os.Getenv("BYTEDANC E_TTS_APP_ID")
+func initTTSConfig() error {
+	appID := os.Getenv("BYTEDANCE_TTS_APP_ID")
 	bearerToken := os.Getenv("BYTEDANCE_TTS_BEARER_TOKEN")
-cluster := os.Getenv("BYTEDANCE_TTS_CLUSTER")
+	cluster := os.Getenv("BYTEDANCE_TTS_CLUSTER")
 	voiceType := os.Getenv("BYTEDANCE_TTS_VOICE_TYPE")
 
 	missingVars := []string{}
 	if appID == "" {
 		missingVars = append(missingVars, "BYTEDANCE_TTS_APP_ID")
 	}
-if bearerToken == "" {
+	if bearerToken == "" {
 		missingVars = append(missingVars, "BYTEDANCE_TTS_BEARER_TOKEN")
 	}
 	if cluster == "" {
@@ -155,15 +155,17 @@ if bearerToken == "" {
 	}
 	if voiceType == "" {
 		missingVars = append(missingVars, "BYTEDANCE_TTS_VOICE_TYPE")
-}
+	}
 
 	if len(missingVars) > 0 {
 		return fmt.Errorf("缺少必需的环境变量: %v", missingVars)
 	}
- 
-	url := os.Getenv( "BYTEDANCE_TTS_ENDPOINT")
+
+	url := os.Getenv("BYTEDANCE_TTS_ENDPOINT")
 	if url == "" {
-	
+		url = "https://openspeech.bytedance.com/api/v1/tts"
+	}
+
 	timeout := DEFAULT_TIMEOUT
 	if timeoutStr := os.Getenv("BYTEDANCE_TTS_TIMEOUT"); timeoutStr != "" {
 		if parsedTimeout, err := time.ParseDuration(timeoutStr); err == nil {
@@ -453,7 +455,7 @@ func addRequestStats(success bool, responseTime time.Duration, errMsg string) {
 	apiStats.recentResponseTimes[apiStats.responseTimesIndex] = responseTime.Seconds() * 1000
 	apiStats.responseTimesIndex = (apiStats.responseTimesIndex + 1) % MAX_RESPONSE_TIMES
 
-if success {
+	if success {
 		apiStats.successfulRequests++
 	} else {
 		apiStats.failedRequests++
@@ -469,10 +471,10 @@ func getMemoryInfo() map[string]interface{} {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	return map[string]interface{}{
-		"total_alloc":   m.TotalAlloc,
-		"heap_alloc":    m.HeapAlloc,
-		"heap_inuse":    m.HeapInuse,
-		"goroutines":    runtime.NumGoroutine(),
+		"total_alloc": m.TotalAlloc,
+		"heap_alloc":  m.HeapAlloc,
+		"heap_inuse":  m.HeapInuse,
+		"goroutines":  runtime.NumGoroutine(),
 	}
 }
 
@@ -509,7 +511,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		avgResponseTime = totalResponseTime.Seconds() * 1000 / float64(totalRequests)
 	}
 
-envCheckStatus := checkEnvironmentVariables()
+	envCheckStatus := checkEnvironmentVariables()
 	allEnvVarsSet := envCheckStatus["all_required_vars_set"].(bool)
 
 	status := "ok"
@@ -525,11 +527,11 @@ envCheckStatus := checkEnvironmentVariables()
 		"start_time": startTime.Format(time.RFC3339),
 		"memory":     getMemoryInfo(),
 		"api_stats": map[string]interface{}{
-			"total_requests":          totalRequests,
-			"successful_requests":     successfulRequests,
-			"failed_requests":         failedRequests,
-			"error_rate_percent":      fmt.Sprintf("%.2f", errorRate),
-			"avg_response_time_ms":    fmt.Sprintf("%.2f", avgResponseTime),
+			"total_requests":           totalRequests,
+			"successful_requests":      successfulRequests,
+			"failed_requests":          failedRequests,
+			"error_rate_percent":       fmt.Sprintf("%.2f", errorRate),
+			"avg_response_time_ms":     fmt.Sprintf("%.2f", avgResponseTime),
 			"recent_response_times_ms": recentResponseTimes,
 		},
 		"errors": map[string]interface{}{
