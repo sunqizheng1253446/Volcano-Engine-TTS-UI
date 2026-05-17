@@ -12,6 +12,7 @@
 - ✅ 支持多种发音人和模型版本
 - ✅ 内置速率限制和统计功能
 - ✅ 支持配置API密钥验证
+- ✅ 并发限制：最多同时处理10个请求（保护上游API）
 - ✅ 跨平台支持（Windows/Linux/macOS）
 
 ## 文件说明
@@ -111,7 +112,7 @@ tts_server.exe
 - `model` - 模型名称（OpenAI兼容，实际不影响）
 - `input` - 要合成的文本
 - `voice` - 发音人（OpenAI兼容，实际不影响）
-- `response_format` - 输出格式：`wav`、`mp3`、`opus`、`aac`、`flac`
+- `response_format` - 输出格式：仅支持 `wav`
 - `speed` - 语速：0.25 ~ 4.0
 
 **示例调用：**
@@ -123,17 +124,45 @@ curl -X POST "http://localhost:8080/v1/audio/speech" \
   -o output.wav
 ```
 
-### 健康检查
+### 健康检查（含统计信息）
 
 ```bash
 curl http://localhost:8080/health
 ```
 
-### 统计信息
+返回包含：服务状态、请求统计、错误记录、配置检查结果
 
-```bash
-curl http://localhost:8080/stats
+## 限流机制
+
+为保护上游火山引擎API，服务实现了两层限流保护：
+
+### 1. 全局并发限制
+- **限制**：最多同时处理 **10个** TTS请求
+- **触发**：超过10个并发请求时
+- **错误码**：`503 Service Unavailable`
+- **说明**：确保不超过上游API的并发限制
+
+### 2. IP速率限制
+- **限制**：每个IP每分钟 **100个** 请求
+- **触发**：单个IP调用过于频繁
+- **错误码**：`429 Too Many Requests`
+- **说明**：防止单个客户端滥用服务
+
+### 触发限流时的响应
+```json
+{
+  "error": {
+    "message": "Server is busy, maximum concurrent requests reached.",
+    "type": "concurrency_limit_error",
+    "code": "max_concurrent_requests"
+  }
+}
 ```
+
+### 服务器日志
+触发限流时服务器会输出中文警告日志：
+- `警告: 已达到最大并发请求数限制，拒绝请求 - 客户端IP: x.x.x.x`
+- `警告: 已超过IP速率限制，拒绝请求 - 客户端IP: x.x.x.x`
 
 ## 支持的发音人
 
@@ -173,7 +202,7 @@ OPENAI_TTS_API_KEY=sk-key1,sk-key2,sk-key3
 
 服务启动后会输出详细日志，包括：
 - 服务启动信息
-- 鉴权模式和配置状态
+- 配置状态
 - 请求统计信息
 - 错误详情
 

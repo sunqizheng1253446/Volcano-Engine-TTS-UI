@@ -24,17 +24,18 @@ import (
 )
 
 const (
-	DEFAULT_PORT          = "8080"
-	DEFAULT_TIMEOUT       = 30 * time.Second
-	MAX_TEXT_LENGTH       = 5000
-	MIN_SPEED             = 0.25
-	MAX_SPEED             = 4.0
-	DEFAULT_SPEED         = 1.0
-	MAX_REQUEST_BODY_SIZE = 1024 * 1024
-	RATE_LIMIT_REQUESTS   = 100
-	RATE_LIMIT_WINDOW     = time.Minute
-	MAX_RESPONSE_TIMES    = 100
-	MAX_ERRORS            = 10
+	DEFAULT_PORT            = "8080"
+	DEFAULT_TIMEOUT         = 30 * time.Second
+	MAX_TEXT_LENGTH         = 5000
+	MIN_SPEED               = 0.25
+	MAX_SPEED               = 4.0
+	DEFAULT_SPEED           = 1.0
+	MAX_REQUEST_BODY_SIZE   = 1024 * 1024
+	RATE_LIMIT_REQUESTS     = 100
+	RATE_LIMIT_WINDOW       = time.Minute
+	MAX_RESPONSE_TIMES      = 100
+	MAX_ERRORS              = 10
+	MAX_CONCURRENT_REQUESTS = 10
 )
 
 type V3TTSResponse struct {
@@ -95,6 +96,7 @@ var (
 	globalHTTPClient *http.Client
 	apiStats         *Stats
 	rateLimiter      *RateLimiter
+	concurrencySem   chan struct{}
 )
 
 func init() {
@@ -118,6 +120,8 @@ func init() {
 		limit:    RATE_LIMIT_REQUESTS,
 		window:   RATE_LIMIT_WINDOW,
 	}
+
+	concurrencySem = make(chan struct{}, MAX_CONCURRENT_REQUESTS)
 }
 
 func (rl *RateLimiter) Allow(key string) bool {
@@ -442,6 +446,7 @@ func openaiTTSHandler(w http.ResponseWriter, r *http.Request) {
 
 	clientIP := getClientIP(r)
 	if !rateLimiter.Allow(clientIP) {
+		log.Printf("警告: 已超过IP速率限制，拒绝请求 - 客户端IP: %s", clientIP)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -449,6 +454,23 @@ func openaiTTSHandler(w http.ResponseWriter, r *http.Request) {
 				"message": "Rate limit exceeded. Please try again later.",
 				"type":    "rate_limit_error",
 				"code":    "rate_limit_exceeded",
+			},
+		})
+		return
+	}
+
+	select {
+	case concurrencySem <- struct{}{}:
+		defer func() { <-concurrencySem }()
+	default:
+		log.Printf("警告: 已达到最大并发请求数限制，拒绝请求 - 客户端IP: %s", getClientIP(r))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": "Server is busy, maximum concurrent requests reached. Please try again later.",
+				"type":    "concurrency_limit_error",
+				"code":    "max_concurrent_requests",
 			},
 		})
 		return
