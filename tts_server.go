@@ -62,9 +62,6 @@ type OpenAITTSRequest struct {
 }
 
 type ByteDanceTTSConfig struct {
-	AuthMode   string
-	AppID      string
-	AccessKey  string
 	ApiKey     string
 	ResourceId string
 	Speaker    string
@@ -149,39 +146,20 @@ func (rl *RateLimiter) Allow(key string) bool {
 }
 
 func initTTSConfig() error {
-	authMode := os.Getenv("BYTEDANCE_TTS_AUTH_MODE")
-	appID := os.Getenv("BYTEDANCE_TTS_APP_ID")
-	accessKey := os.Getenv("BYTEDANCE_TTS_ACCESS_KEY")
 	apiKey := os.Getenv("BYTEDANCE_TTS_API_KEY")
 	resourceId := os.Getenv("BYTEDANCE_TTS_RESOURCE_ID")
 	speaker := os.Getenv("BYTEDANCE_TTS_SPEAKER")
 
 	missingVars := []string{}
 
-	if authMode == "" {
-		missingVars = append(missingVars, "BYTEDANCE_TTS_AUTH_MODE")
-	} else if authMode != "legacy" && authMode != "new" {
-		return fmt.Errorf("BYTEDANCE_TTS_AUTH_MODE 无效，必须是 'legacy' (旧版 AppID+AccessKey) 或 'new' (新版 ApiKey)")
+	if apiKey == "" {
+		missingVars = append(missingVars, "BYTEDANCE_TTS_API_KEY")
 	}
-
 	if resourceId == "" {
 		missingVars = append(missingVars, "BYTEDANCE_TTS_RESOURCE_ID")
 	}
 	if speaker == "" {
 		missingVars = append(missingVars, "BYTEDANCE_TTS_SPEAKER")
-	}
-
-	if authMode == "legacy" {
-		if appID == "" {
-			missingVars = append(missingVars, "BYTEDANCE_TTS_APP_ID")
-		}
-		if accessKey == "" {
-			missingVars = append(missingVars, "BYTEDANCE_TTS_ACCESS_KEY")
-		}
-	} else if authMode == "new" {
-		if apiKey == "" {
-			missingVars = append(missingVars, "BYTEDANCE_TTS_API_KEY")
-		}
 	}
 
 	if len(missingVars) > 0 {
@@ -200,9 +178,6 @@ func initTTSConfig() error {
 	}
 
 	ttsConfig = ByteDanceTTSConfig{
-		AuthMode:   authMode,
-		AppID:      appID,
-		AccessKey:  accessKey,
 		ApiKey:     apiKey,
 		ResourceId: resourceId,
 		Speaker:    speaker,
@@ -227,19 +202,10 @@ func initAPIKeys() {
 }
 
 func checkEnvironmentVariables() map[string]interface{} {
-	authMode := os.Getenv("BYTEDANCE_TTS_AUTH_MODE")
-
 	requiredVars := map[string]bool{
-		"BYTEDANCE_TTS_AUTH_MODE":   authMode != "",
+		"BYTEDANCE_TTS_API_KEY":     os.Getenv("BYTEDANCE_TTS_API_KEY") != "",
 		"BYTEDANCE_TTS_RESOURCE_ID": os.Getenv("BYTEDANCE_TTS_RESOURCE_ID") != "",
 		"BYTEDANCE_TTS_SPEAKER":     os.Getenv("BYTEDANCE_TTS_SPEAKER") != "",
-	}
-
-	if authMode == "legacy" {
-		requiredVars["BYTEDANCE_TTS_APP_ID"] = os.Getenv("BYTEDANCE_TTS_APP_ID") != ""
-		requiredVars["BYTEDANCE_TTS_ACCESS_KEY"] = os.Getenv("BYTEDANCE_TTS_ACCESS_KEY") != ""
-	} else if authMode == "new" {
-		requiredVars["BYTEDANCE_TTS_API_KEY"] = os.Getenv("BYTEDANCE_TTS_API_KEY") != ""
 	}
 
 	missingVars := []string{}
@@ -324,13 +290,7 @@ func synthesis(text string, speed float64) ([]byte, error) {
 		"Connection":        "keep-alive",
 		"X-Api-Resource-Id": ttsConfig.ResourceId,
 		"X-Api-Request-Id":  reqID,
-	}
-
-	if ttsConfig.AuthMode == "legacy" {
-		headers["X-Api-App-Id"] = ttsConfig.AppID
-		headers["X-Api-Access-Key"] = ttsConfig.AccessKey
-	} else {
-		headers["X-Api-Key"] = ttsConfig.ApiKey
+		"X-Api-Key":         ttsConfig.ApiKey,
 	}
 
 	bodyStr, err := json.Marshal(params)
@@ -745,7 +705,6 @@ func main() {
 		log.Printf("OpenAI TTS endpoint: http://localhost:%s/v1/audio/speech", port)
 		log.Printf("Health check: http://localhost:%s/health", port)
 		log.Printf("Using ByteDance v3 API: %s", ttsConfig.URL)
-		log.Printf("Auth Mode: %s", ttsConfig.AuthMode)
 		log.Printf("Resource ID: %s", ttsConfig.ResourceId)
 		log.Printf("Speaker: %s", ttsConfig.Speaker)
 

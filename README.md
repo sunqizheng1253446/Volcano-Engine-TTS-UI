@@ -8,7 +8,7 @@
 
 - ✅ 完全兼容OpenAI `/v1/audio/speech` API接口
 - ✅ 支持火山引擎TTS v3 API（单向流式）
-- ✅ 支持两种鉴权模式：Legacy(AppID+AccessKey) 和 New(API Key)
+- ✅ 支持API Key鉴权方式
 - ✅ 支持多种发音人和模型版本
 - ✅ 内置速率限制和统计功能
 - ✅ 支持配置API密钥验证
@@ -61,18 +61,9 @@ tts_server.exe
 
 | 变量名 | 说明 | 示例 |
 |--------|------|------|
-| `BYTEDANCE_TTS_AUTH_MODE` | 鉴权模式：`legacy` 或 `new` | `legacy` |
+| `BYTEDANCE_TTS_API_KEY` | 火山引擎新版控制台 API Key | `your_api_key_here` |
 | `BYTEDANCE_TTS_RESOURCE_ID` | 资源ID，决定模型版本 | `seed-tts-1.0` |
 | `BYTEDANCE_TTS_SPEAKER` | 发音人（音色）ID | `zh_female_qingxin` |
-
-### 鉴权参数（二选一）
-
-**Legacy 模式（旧版控制台）：**
-- `BYTEDANCE_TTS_APP_ID` - 应用ID
-- `BYTEDANCE_TTS_ACCESS_KEY` - 访问密钥
-
-**New 模式（新版控制台）：**
-- `BYTEDANCE_TTS_API_KEY` - API密钥
 
 ### 可选参数
 
@@ -154,10 +145,9 @@ curl http://localhost:8080/stats
 
 ### 1. 如何获取鉴权信息？
 
-- 登录火山引擎控制台
+- 登录火山引擎新版控制台
 - 进入"语音合成"服务
-- 在应用管理中创建应用并获取AppID和AccessKey（Legacy模式）
-- 或在新版控制台获取API Key（New模式）
+- 创建应用并获取API Key
 
 ### 2. 端口被占用怎么办？
 
