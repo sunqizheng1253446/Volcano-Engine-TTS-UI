@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -36,13 +37,20 @@ const (
 	MAX_ERRORS            = 10
 )
 
-type TTSServResponse struct {
-	ReqID     string `json:"reqid"`
-	Code      int    `json:"code"`
-	Message   string `json:"Message"`
-	Operation string `json:"operation"`
-	Sequence  int    `json:"sequence"`
-	Data      string `json:"data"`
+type V3TTSResponse struct {
+	ReqID    string `json:"reqid"`
+	Code     int    `json:"code"`
+	Message  string `json:"message"`
+	Event    string `json:"event"`
+	Sequence int    `json:"sequence"`
+	Data     string `json:"data"`
+	Sentence string `json:"sentence,omitempty"`
+	IsFinal  bool   `json:"is_final"`
+	Usage    *Usage `json:"usage,omitempty"`
+}
+
+type Usage struct {
+	TextWords int `json:"text_words"`
 }
 
 type OpenAITTSRequest struct {
@@ -54,12 +62,14 @@ type OpenAITTSRequest struct {
 }
 
 type ByteDanceTTSConfig struct {
-	AppID       string
-	BearerToken string
-	Cluster     string
-	URL         string
-	VoiceType   string
-	Timeout     time.Duration
+	AuthMode   string
+	AppID      string
+	AccessKey  string
+	ApiKey     string
+	ResourceId string
+	Speaker    string
+	URL        string
+	Timeout    time.Duration
 }
 
 type RateLimiter struct {
@@ -138,33 +148,46 @@ func (rl *RateLimiter) Allow(key string) bool {
 }
 
 func initTTSConfig() error {
+	authMode := os.Getenv("BYTEDANCE_TTS_AUTH_MODE")
 	appID := os.Getenv("BYTEDANCE_TTS_APP_ID")
-	bearerToken := os.Getenv("BYTEDANCE_TTS_BEARER_TOKEN")
-	cluster := os.Getenv("BYTEDANCE_TTS_CLUSTER")
-	voiceType := os.Getenv("BYTEDANCE_TTS_VOICE_TYPE")
+	accessKey := os.Getenv("BYTEDANCE_TTS_ACCESS_KEY")
+	apiKey := os.Getenv("BYTEDANCE_TTS_API_KEY")
+	resourceId := os.Getenv("BYTEDANCE_TTS_RESOURCE_ID")
+	speaker := os.Getenv("BYTEDANCE_TTS_SPEAKER")
 
 	missingVars := []string{}
-	if appID == "" {
-		missingVars = append(missingVars, "BYTEDANCE_TTS_APP_ID")
+
+	if authMode == "" {
+		missingVars = append(missingVars, "BYTEDANCE_TTS_AUTH_MODE")
+	} else if authMode != "legacy" && authMode != "new" {
+		return fmt.Errorf("BYTEDANCE_TTS_AUTH_MODE 无效，必须是 'legacy' (旧版 AppID+AccessKey) 或 'new' (新版 ApiKey)")
 	}
-	if bearerToken == "" {
-		missingVars = append(missingVars, "BYTEDANCE_TTS_BEARER_TOKEN")
+
+	if resourceId == "" {
+		missingVars = append(missingVars, "BYTEDANCE_TTS_RESOURCE_ID")
 	}
-	if cluster == "" {
-		missingVars = append(missingVars, "BYTEDANCE_TTS_CLUSTER")
+	if speaker == "" {
+		missingVars = append(missingVars, "BYTEDANCE_TTS_SPEAKER")
 	}
-	if voiceType == "" {
-		missingVars = append(missingVars, "BYTEDANCE_TTS_VOICE_TYPE")
+
+	if authMode == "legacy" {
+		if appID == "" {
+			missingVars = append(missingVars, "BYTEDANCE_TTS_APP_ID")
+		}
+		if accessKey == "" {
+			missingVars = append(missingVars, "BYTEDANCE_TTS_ACCESS_KEY")
+		}
+	} else if authMode == "new" {
+		if apiKey == "" {
+			missingVars = append(missingVars, "BYTEDANCE_TTS_API_KEY")
+		}
 	}
 
 	if len(missingVars) > 0 {
 		return fmt.Errorf("缺少必需的环境变量: %v", missingVars)
 	}
 
-	url := os.Getenv("BYTEDANCE_TTS_ENDPOINT")
-	if url == "" {
-		url = "https://openspeech.bytedance.com/api/v1/tts"
-	}
+	url := "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 
 	timeout := DEFAULT_TIMEOUT
 	if timeoutStr := os.Getenv("BYTEDANCE_TTS_TIMEOUT"); timeoutStr != "" {
@@ -176,12 +199,14 @@ func initTTSConfig() error {
 	}
 
 	ttsConfig = ByteDanceTTSConfig{
-		AppID:       appID,
-		BearerToken: bearerToken,
-		Cluster:     cluster,
-		URL:         url,
-		VoiceType:   voiceType,
-		Timeout:     timeout,
+		AuthMode:   authMode,
+		AppID:      appID,
+		AccessKey:  accessKey,
+		ApiKey:     apiKey,
+		ResourceId: resourceId,
+		Speaker:    speaker,
+		URL:        url,
+		Timeout:    timeout,
 	}
 
 	return nil
@@ -201,11 +226,19 @@ func initAPIKeys() {
 }
 
 func checkEnvironmentVariables() map[string]interface{} {
+	authMode := os.Getenv("BYTEDANCE_TTS_AUTH_MODE")
+
 	requiredVars := map[string]bool{
-		"BYTEDANCE_TTS_APP_ID":       os.Getenv("BYTEDANCE_TTS_APP_ID") != "",
-		"BYTEDANCE_TTS_BEARER_TOKEN": os.Getenv("BYTEDANCE_TTS_BEARER_TOKEN") != "",
-		"BYTEDANCE_TTS_CLUSTER":      os.Getenv("BYTEDANCE_TTS_CLUSTER") != "",
-		"BYTEDANCE_TTS_VOICE_TYPE":   os.Getenv("BYTEDANCE_TTS_VOICE_TYPE") != "",
+		"BYTEDANCE_TTS_AUTH_MODE":   authMode != "",
+		"BYTEDANCE_TTS_RESOURCE_ID": os.Getenv("BYTEDANCE_TTS_RESOURCE_ID") != "",
+		"BYTEDANCE_TTS_SPEAKER":     os.Getenv("BYTEDANCE_TTS_SPEAKER") != "",
+	}
+
+	if authMode == "legacy" {
+		requiredVars["BYTEDANCE_TTS_APP_ID"] = os.Getenv("BYTEDANCE_TTS_APP_ID") != ""
+		requiredVars["BYTEDANCE_TTS_ACCESS_KEY"] = os.Getenv("BYTEDANCE_TTS_ACCESS_KEY") != ""
+	} else if authMode == "new" {
+		requiredVars["BYTEDANCE_TTS_API_KEY"] = os.Getenv("BYTEDANCE_TTS_API_KEY") != ""
 	}
 
 	missingVars := []string{}
@@ -216,10 +249,9 @@ func checkEnvironmentVariables() map[string]interface{} {
 	}
 
 	optionalVars := map[string]bool{
-		"BYTEDANCE_TTS_ENDPOINT": os.Getenv("BYTEDANCE_TTS_ENDPOINT") != "",
-		"BYTEDANCE_TTS_TIMEOUT":  os.Getenv("BYTEDANCE_TTS_TIMEOUT") != "",
-		"OPENAI_TTS_API_KEY":     os.Getenv("OPENAI_TTS_API_KEY") != "",
-		"PORT":                   os.Getenv("PORT") != "",
+		"BYTEDANCE_TTS_TIMEOUT": os.Getenv("BYTEDANCE_TTS_TIMEOUT") != "",
+		"OPENAI_TTS_API_KEY":    os.Getenv("OPENAI_TTS_API_KEY") != "",
+		"PORT":                  os.Getenv("PORT") != "",
 	}
 
 	return map[string]interface{}{
@@ -230,7 +262,7 @@ func checkEnvironmentVariables() map[string]interface{} {
 	}
 }
 
-func httpPost(url string, headers map[string]string, body []byte, timeout time.Duration) ([]byte, error) {
+func httpPostStream(url string, headers map[string]string, body []byte, timeout time.Duration) (*http.Response, error) {
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(body))
 	if err != nil {
 		return nil, err
@@ -240,50 +272,65 @@ func httpPost(url string, headers map[string]string, body []byte, timeout time.D
 	}
 
 	client := globalHTTPClient
-	if timeout != 0 && timeout != ttsConfig.Timeout {
-		client = &http.Client{Timeout: timeout}
+	if timeout != 0 {
+		client = &http.Client{
+			Timeout: timeout,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     90 * time.Second,
+				TLSHandshakeTimeout: 10 * time.Second,
+			},
+		}
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	return client.Do(req)
+}
 
-	retBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+func convertSpeedToSpeechRate(speed float64) int {
+	if speed <= 0.5 {
+		return -50
 	}
-	return retBody, nil
+	if speed >= 2.0 {
+		return 100
+	}
+	return int((speed - 1.0) * 100)
 }
 
 func synthesis(text string, speed float64) ([]byte, error) {
 	reqID := uuid.NewString()
-	params := make(map[string]map[string]interface{})
-	params["app"] = make(map[string]interface{})
-	params["app"]["appid"] = ttsConfig.AppID
-	params["app"]["token"] = "access_token"
-	params["app"]["cluster"] = ttsConfig.Cluster
 
-	params["user"] = make(map[string]interface{})
-	params["user"]["uid"] = "uid"
+	speechRate := convertSpeedToSpeechRate(speed)
 
-	params["audio"] = make(map[string]interface{})
-	params["audio"]["voice_type"] = ttsConfig.VoiceType
-	params["audio"]["encoding"] = "wav"
-	params["audio"]["speed_ratio"] = speed
-	params["audio"]["volume_ratio"] = 1.0
-	params["audio"]["pitch_ratio"] = 1.0
+	params := map[string]interface{}{
+		"user": map[string]interface{}{
+			"uid": "uid",
+		},
+		"namespace": "BidirectionalTTS",
+		"req_params": map[string]interface{}{
+			"text":    text,
+			"speaker": ttsConfig.Speaker,
+			"audio_params": map[string]interface{}{
+				"format":      "wav",
+				"sample_rate": 24000,
+				"speech_rate": speechRate,
+			},
+		},
+	}
 
-	params["request"] = make(map[string]interface{})
-	params["request"]["reqid"] = reqID
-	params["request"]["text"] = text
-	params["request"]["text_type"] = "plain"
-	params["request"]["operation"] = "query"
+	headers := map[string]string{
+		"Content-Type":      "application/json",
+		"Connection":        "keep-alive",
+		"X-Api-Resource-Id": ttsConfig.ResourceId,
+		"X-Api-Request-Id":  reqID,
+	}
 
-	headers := make(map[string]string)
-	headers["Content-Type"] = "application/json"
-	headers["Authorization"] = fmt.Sprintf("Bearer;%s", ttsConfig.BearerToken)
+	if ttsConfig.AuthMode == "legacy" {
+		headers["X-Api-App-Id"] = ttsConfig.AppID
+		headers["X-Api-Access-Key"] = ttsConfig.AccessKey
+	} else {
+		headers["X-Api-Key"] = ttsConfig.ApiKey
+	}
 
 	bodyStr, err := json.Marshal(params)
 	if err != nil {
@@ -291,30 +338,69 @@ func synthesis(text string, speed float64) ([]byte, error) {
 		return nil, err
 	}
 
-	synResp, err := httpPost(ttsConfig.URL, headers, bodyStr, ttsConfig.Timeout)
+	resp, err := httpPostStream(ttsConfig.URL, headers, bodyStr, ttsConfig.Timeout)
 	if err != nil {
 		log.Printf("http post fail: %v", err)
 		return nil, err
 	}
+	defer resp.Body.Close()
 
-	var respJSON TTSServResponse
-	err = json.Unmarshal(synResp, &respJSON)
-	if err != nil {
-		log.Printf("unmarshal response fail: %v", err)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("TTS service error: status=%d, body=%s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("TTS service error: status %d", resp.StatusCode)
+	}
+
+	var audioData []byte
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var v3Resp V3TTSResponse
+		if err := json.Unmarshal(line, &v3Resp); err != nil {
+			log.Printf("unmarshal chunk fail: %v, line: %s", err, string(line))
+			continue
+		}
+
+		if v3Resp.Code == 20000000 {
+			if v3Resp.Usage != nil {
+				log.Printf("TTS synthesis completed, usage: %+v", v3Resp.Usage)
+			}
+			break
+		}
+
+		if v3Resp.Code != 0 {
+			log.Printf("TTS service error: code=%d, message=%s", v3Resp.Code, v3Resp.Message)
+			return nil, fmt.Errorf("TTS service error: %s", v3Resp.Message)
+		}
+
+		if v3Resp.Data != "" {
+			chunk, err := base64.StdEncoding.DecodeString(v3Resp.Data)
+			if err != nil {
+				log.Printf("base64 decode fail: %v", err)
+				return nil, err
+			}
+			audioData = append(audioData, chunk...)
+		} else if v3Resp.Sentence != "" {
+			log.Printf("Received sentence info (sequence %d): %s", v3Resp.Sequence, v3Resp.Sentence)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("read stream fail: %v", err)
 		return nil, err
 	}
 
-	if respJSON.Code != 3000 {
-		log.Printf("TTS service error: code=%d, message=%s", respJSON.Code, respJSON.Message)
-		return nil, fmt.Errorf("TTS service error")
+	if len(audioData) == 0 {
+		return nil, fmt.Errorf("no audio data received")
 	}
 
-	audio, err := base64.StdEncoding.DecodeString(respJSON.Data)
-	if err != nil {
-		log.Printf("base64 decode fail: %v", err)
-		return nil, err
-	}
-	return audio, nil
+	return audioData, nil
 }
 
 func validateAPIKey(r *http.Request) bool {
@@ -522,7 +608,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	response := map[string]interface{}{
 		"status":     status,
 		"service":    "ByteDance TTS to OpenAI API Adapter",
-		"version":    "1.1.0",
+		"version":    "2.0.0 (v3 API)",
 		"uptime":     fmt.Sprintf("%.0f seconds", time.Since(startTime).Seconds()),
 		"start_time": startTime.Format(time.RFC3339),
 		"memory":     getMemoryInfo(),
@@ -629,9 +715,14 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("Starting ByteDance TTS to OpenAI API adapter server on port %s", port)
+		log.Printf("Starting ByteDance TTS to OpenAI API Adapter Server")
+		log.Printf("Listening on port: %s", port)
 		log.Printf("OpenAI TTS endpoint: http://localhost:%s/v1/audio/speech", port)
 		log.Printf("Health check: http://localhost:%s/health", port)
+		log.Printf("Using ByteDance v3 API: %s", ttsConfig.URL)
+		log.Printf("Auth Mode: %s", ttsConfig.AuthMode)
+		log.Printf("Resource ID: %s", ttsConfig.ResourceId)
+		log.Printf("Speaker: %s", ttsConfig.Speaker)
 
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed to start: %v", err)
