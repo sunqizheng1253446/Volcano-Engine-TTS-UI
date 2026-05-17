@@ -94,6 +94,7 @@ type Stats struct {
 var (
 	VALID_API_KEYS   []string
 	ttsConfig        ByteDanceTTSConfig
+	ttsConfigErr     error
 	globalHTTPClient *http.Client
 	apiStats         *Stats
 	rateLimiter      *RateLimiter
@@ -466,6 +467,19 @@ func openaiTTSHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if ttsConfigErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": fmt.Sprintf("TTS service configuration error: %v. Please check environment variables and restart the service.", ttsConfigErr),
+				"type":    "configuration_error",
+				"code":    "service_unavailable",
+			},
+		})
+		return
+	}
+
 	clientIP := getClientIP(r)
 	if !rateLimiter.Allow(clientIP) {
 		w.Header().Set("Content-Type", "application/json")
@@ -566,7 +580,12 @@ func getMemoryInfo() map[string]interface{} {
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
+
+	if ttsConfigErr != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
 
 	apiStats.mutex.RLock()
 	totalRequests := apiStats.totalRequests
@@ -625,6 +644,8 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		},
 		"config_status": map[string]interface{}{
 			"all_required_vars_set": allEnvVarsSet,
+			"config_error":          ttsConfigErr != nil,
+			"config_error_message":  fmt.Sprintf("%v", ttsConfigErr),
 		},
 	}
 
@@ -666,8 +687,12 @@ func main() {
 
 	initAPIKeys()
 
-	if err := initTTSConfig(); err != nil {
-		log.Fatalf("配置初始化失败: %v", err)
+	ttsConfigErr = initTTSConfig()
+	if ttsConfigErr != nil {
+		log.Printf("警告: 配置初始化失败: %v", ttsConfigErr)
+		log.Printf("服务将继续运行，但TTS功能不可用，请检查环境变量配置")
+	} else {
+		log.Printf("配置初始化成功")
 	}
 
 	router := mux.NewRouter()
