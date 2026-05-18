@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -23,26 +24,34 @@ import (
 )
 
 const (
-	DEFAULT_PORT          = "8080"
-	DEFAULT_TIMEOUT       = 30 * time.Second
-	MAX_TEXT_LENGTH       = 5000
-	MIN_SPEED             = 0.25
-	MAX_SPEED             = 4.0
-	DEFAULT_SPEED         = 1.0
-	MAX_REQUEST_BODY_SIZE = 1024 * 1024
-	RATE_LIMIT_REQUESTS   = 100
-	RATE_LIMIT_WINDOW     = time.Minute
-	MAX_RESPONSE_TIMES    = 100
-	MAX_ERRORS            = 10
+	DEFAULT_PORT            = "8080"
+	DEFAULT_TIMEOUT         = 30 * time.Second
+	MAX_TEXT_LENGTH         = 5000
+	MIN_SPEED               = 0.25
+	MAX_SPEED               = 4.0
+	DEFAULT_SPEED           = 1.0
+	MAX_REQUEST_BODY_SIZE   = 1024 * 1024
+	RATE_LIMIT_REQUESTS     = 100
+	RATE_LIMIT_WINDOW       = time.Minute
+	MAX_RESPONSE_TIMES      = 100
+	MAX_ERRORS              = 10
+	MAX_CONCURRENT_REQUESTS = 10
 )
 
-type TTSServResponse struct {
-	ReqID     string `json:"reqid"`
-	Code      int    `json:"code"`
-	Message   string `json:"Message"`
-	Operation string `json:"operation"`
-	Sequence  int    `json:"sequence"`
-	Data      string `json:"data"`
+type V3TTSResponse struct {
+	ReqID    string `json:"reqid"`
+	Code     int    `json:"code"`
+	Message  string `json:"message"`
+	Event    string `json:"event"`
+	Sequence int    `json:"sequence"`
+	Data     string `json:"data"`
+	Sentence string `json:"sentence,omitempty"`
+	IsFinal  bool   `json:"is_final"`
+	Usage    *Usage `json:"usage,omitempty"`
+}
+
+type Usage struct {
+	TextWords int `json:"text_words"`
 }
 
 type OpenAITTSRequest struct {
@@ -54,20 +63,22 @@ type OpenAITTSRequest struct {
 }
 
 type ByteDanceTTSConfig struct {
-	AppID       string
-	BearerToken string
-	Cluster     string
-	URL         string
-	VoiceType   string
-	Timeout     time.Duration
+	ApiKey     string
+	ResourceId string
+	Speaker    string
+	URL        string
+	Timeout    time.Duration
 }
 
 type RateLimiter struct {
-	requests map[string][]time.Time
-	mutex    sync.Mutex
-	limit    int
-	window   time.Duration
+	requests    map[string][]time.Time
+	mutex       sync.Mutex
+	limit       int
+	window      time.Duration
+	lastCleanup time.Time
 }
+
+const cleanupInterval = time.Hour
 
 type Stats struct {
 	totalRequests       int64
@@ -84,9 +95,11 @@ type Stats struct {
 var (
 	VALID_API_KEYS   []string
 	ttsConfig        ByteDanceTTSConfig
+	ttsConfigErr     error
 	globalHTTPClient *http.Client
 	apiStats         *Stats
 	rateLimiter      *RateLimiter
+	concurrencySem   chan struct{}
 )
 
 func init() {
@@ -110,6 +123,8 @@ func init() {
 		limit:    RATE_LIMIT_REQUESTS,
 		window:   RATE_LIMIT_WINDOW,
 	}
+
+	concurrencySem = make(chan struct{}, MAX_CONCURRENT_REQUESTS)
 }
 
 func (rl *RateLimiter) Allow(key string) bool {
@@ -118,6 +133,11 @@ func (rl *RateLimiter) Allow(key string) bool {
 
 	now := time.Now()
 	cutoff := now.Add(-rl.window)
+
+	if now.Sub(rl.lastCleanup) > cleanupInterval {
+		rl.cleanup()
+		rl.lastCleanup = now
+	}
 
 	timestamps := rl.requests[key]
 	valid := make([]time.Time, 0, len(timestamps))
@@ -137,34 +157,45 @@ func (rl *RateLimiter) Allow(key string) bool {
 	return true
 }
 
+func (rl *RateLimiter) cleanup() {
+	cutoff := time.Now().Add(-rl.window)
+	for k, v := range rl.requests {
+		valid := make([]time.Time, 0, len(v))
+		for _, ts := range v {
+			if ts.After(cutoff) {
+				valid = append(valid, ts)
+			}
+		}
+		if len(valid) == 0 {
+			delete(rl.requests, k)
+		} else {
+			rl.requests[k] = valid
+		}
+	}
+}
+
 func initTTSConfig() error {
-	appID := os.Getenv("BYTEDANCE_TTS_APP_ID")
-	bearerToken := os.Getenv("BYTEDANCE_TTS_BEARER_TOKEN")
-	cluster := os.Getenv("BYTEDANCE_TTS_CLUSTER")
-	voiceType := os.Getenv("BYTEDANCE_TTS_VOICE_TYPE")
+	apiKey := os.Getenv("BYTEDANCE_TTS_API_KEY")
+	resourceId := os.Getenv("BYTEDANCE_TTS_RESOURCE_ID")
+	speaker := os.Getenv("BYTEDANCE_TTS_SPEAKER")
 
 	missingVars := []string{}
-	if appID == "" {
-		missingVars = append(missingVars, "BYTEDANCE_TTS_APP_ID")
+
+	if apiKey == "" {
+		missingVars = append(missingVars, "BYTEDANCE_TTS_API_KEY")
 	}
-	if bearerToken == "" {
-		missingVars = append(missingVars, "BYTEDANCE_TTS_BEARER_TOKEN")
+	if resourceId == "" {
+		missingVars = append(missingVars, "BYTEDANCE_TTS_RESOURCE_ID")
 	}
-	if cluster == "" {
-		missingVars = append(missingVars, "BYTEDANCE_TTS_CLUSTER")
-	}
-	if voiceType == "" {
-		missingVars = append(missingVars, "BYTEDANCE_TTS_VOICE_TYPE")
+	if speaker == "" {
+		missingVars = append(missingVars, "BYTEDANCE_TTS_SPEAKER")
 	}
 
 	if len(missingVars) > 0 {
 		return fmt.Errorf("缺少必需的环境变量: %v", missingVars)
 	}
 
-	url := os.Getenv("BYTEDANCE_TTS_ENDPOINT")
-	if url == "" {
-		url = "https://openspeech.bytedance.com/api/v1/tts"
-	}
+	url := "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 
 	timeout := DEFAULT_TIMEOUT
 	if timeoutStr := os.Getenv("BYTEDANCE_TTS_TIMEOUT"); timeoutStr != "" {
@@ -176,12 +207,11 @@ func initTTSConfig() error {
 	}
 
 	ttsConfig = ByteDanceTTSConfig{
-		AppID:       appID,
-		BearerToken: bearerToken,
-		Cluster:     cluster,
-		URL:         url,
-		VoiceType:   voiceType,
-		Timeout:     timeout,
+		ApiKey:     apiKey,
+		ResourceId: resourceId,
+		Speaker:    speaker,
+		URL:        url,
+		Timeout:    timeout,
 	}
 
 	return nil
@@ -202,10 +232,9 @@ func initAPIKeys() {
 
 func checkEnvironmentVariables() map[string]interface{} {
 	requiredVars := map[string]bool{
-		"BYTEDANCE_TTS_APP_ID":       os.Getenv("BYTEDANCE_TTS_APP_ID") != "",
-		"BYTEDANCE_TTS_BEARER_TOKEN": os.Getenv("BYTEDANCE_TTS_BEARER_TOKEN") != "",
-		"BYTEDANCE_TTS_CLUSTER":      os.Getenv("BYTEDANCE_TTS_CLUSTER") != "",
-		"BYTEDANCE_TTS_VOICE_TYPE":   os.Getenv("BYTEDANCE_TTS_VOICE_TYPE") != "",
+		"BYTEDANCE_TTS_API_KEY":     os.Getenv("BYTEDANCE_TTS_API_KEY") != "",
+		"BYTEDANCE_TTS_RESOURCE_ID": os.Getenv("BYTEDANCE_TTS_RESOURCE_ID") != "",
+		"BYTEDANCE_TTS_SPEAKER":     os.Getenv("BYTEDANCE_TTS_SPEAKER") != "",
 	}
 
 	missingVars := []string{}
@@ -216,10 +245,9 @@ func checkEnvironmentVariables() map[string]interface{} {
 	}
 
 	optionalVars := map[string]bool{
-		"BYTEDANCE_TTS_ENDPOINT": os.Getenv("BYTEDANCE_TTS_ENDPOINT") != "",
-		"BYTEDANCE_TTS_TIMEOUT":  os.Getenv("BYTEDANCE_TTS_TIMEOUT") != "",
-		"OPENAI_TTS_API_KEY":     os.Getenv("OPENAI_TTS_API_KEY") != "",
-		"PORT":                   os.Getenv("PORT") != "",
+		"BYTEDANCE_TTS_TIMEOUT": os.Getenv("BYTEDANCE_TTS_TIMEOUT") != "",
+		"OPENAI_TTS_API_KEY":    os.Getenv("OPENAI_TTS_API_KEY") != "",
+		"PORT":                  os.Getenv("PORT") != "",
 	}
 
 	return map[string]interface{}{
@@ -230,7 +258,7 @@ func checkEnvironmentVariables() map[string]interface{} {
 	}
 }
 
-func httpPost(url string, headers map[string]string, body []byte, timeout time.Duration) ([]byte, error) {
+func httpPostStream(url string, headers map[string]string, body []byte, timeout time.Duration) (*http.Response, error) {
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(body))
 	if err != nil {
 		return nil, err
@@ -239,51 +267,57 @@ func httpPost(url string, headers map[string]string, body []byte, timeout time.D
 		req.Header.Set(key, value)
 	}
 
-	client := globalHTTPClient
-	if timeout != 0 && timeout != ttsConfig.Timeout {
-		client = &http.Client{Timeout: timeout}
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	req = req.WithContext(ctx)
 
-	retBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	return retBody, nil
+	return globalHTTPClient.Do(req)
 }
 
-func synthesis(text string, speed float64) ([]byte, error) {
+func convertSpeedToSpeechRate(speed float64) int {
+	if speed <= 0.5 {
+		return -50
+	}
+	if speed >= 2.0 {
+		return 100
+	}
+	return int((speed - 1.0) * 100)
+}
+
+type SynthesisResult struct {
+	AudioData []byte
+	ReqID     string
+}
+
+func synthesis(text string, speed float64) (*SynthesisResult, error) {
 	reqID := uuid.NewString()
-	params := make(map[string]map[string]interface{})
-	params["app"] = make(map[string]interface{})
-	params["app"]["appid"] = ttsConfig.AppID
-	params["app"]["token"] = "access_token"
-	params["app"]["cluster"] = ttsConfig.Cluster
 
-	params["user"] = make(map[string]interface{})
-	params["user"]["uid"] = "uid"
+	speechRate := convertSpeedToSpeechRate(speed)
 
-	params["audio"] = make(map[string]interface{})
-	params["audio"]["voice_type"] = ttsConfig.VoiceType
-	params["audio"]["encoding"] = "wav"
-	params["audio"]["speed_ratio"] = speed
-	params["audio"]["volume_ratio"] = 1.0
-	params["audio"]["pitch_ratio"] = 1.0
+	params := map[string]interface{}{
+		"user": map[string]interface{}{
+			"uid": "uid",
+		},
+		"namespace": "BidirectionalTTS",
+		"req_params": map[string]interface{}{
+			"text":    text,
+			"speaker": ttsConfig.Speaker,
+			"audio_params": map[string]interface{}{
+				"format":      "wav",
+				"sample_rate": 24000,
+				"speech_rate": speechRate,
+			},
+		},
+	}
 
-	params["request"] = make(map[string]interface{})
-	params["request"]["reqid"] = reqID
-	params["request"]["text"] = text
-	params["request"]["text_type"] = "plain"
-	params["request"]["operation"] = "query"
-
-	headers := make(map[string]string)
-	headers["Content-Type"] = "application/json"
-	headers["Authorization"] = fmt.Sprintf("Bearer;%s", ttsConfig.BearerToken)
+	headers := map[string]string{
+		"Content-Type":      "application/json",
+		"Connection":        "keep-alive",
+		"X-Api-Resource-Id": ttsConfig.ResourceId,
+		"X-Api-Request-Id":  reqID,
+		"X-Api-Key":         ttsConfig.ApiKey,
+	}
 
 	bodyStr, err := json.Marshal(params)
 	if err != nil {
@@ -291,30 +325,71 @@ func synthesis(text string, speed float64) ([]byte, error) {
 		return nil, err
 	}
 
-	synResp, err := httpPost(ttsConfig.URL, headers, bodyStr, ttsConfig.Timeout)
+	resp, err := httpPostStream(ttsConfig.URL, headers, bodyStr, ttsConfig.Timeout)
 	if err != nil {
 		log.Printf("http post fail: %v", err)
 		return nil, err
 	}
+	defer resp.Body.Close()
 
-	var respJSON TTSServResponse
-	err = json.Unmarshal(synResp, &respJSON)
-	if err != nil {
-		log.Printf("unmarshal response fail: %v", err)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("TTS service error: status=%d, body=%s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("TTS service error: status %d", resp.StatusCode)
+	}
+
+	var audioData []byte
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var v3Resp V3TTSResponse
+		if err := json.Unmarshal(line, &v3Resp); err != nil {
+			log.Printf("unmarshal chunk fail: %v, line: %s", err, string(line))
+			continue
+		}
+
+		if v3Resp.Code == 20000000 {
+			if v3Resp.Usage != nil {
+				log.Printf("TTS synthesis completed, usage: %+v", v3Resp.Usage)
+			}
+			for scanner.Scan() {
+			}
+			break
+		}
+
+		if v3Resp.Code != 0 {
+			log.Printf("TTS service error: code=%d, message=%s", v3Resp.Code, v3Resp.Message)
+			return nil, fmt.Errorf("TTS service error: %s", v3Resp.Message)
+		}
+
+		if v3Resp.Data != "" {
+			chunk, err := base64.StdEncoding.DecodeString(v3Resp.Data)
+			if err != nil {
+				log.Printf("base64 decode fail: %v", err)
+				return nil, err
+			}
+			audioData = append(audioData, chunk...)
+		} else if v3Resp.Sentence != "" {
+			log.Printf("Received sentence info (sequence %d): %s", v3Resp.Sequence, v3Resp.Sentence)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("read stream fail: %v", err)
 		return nil, err
 	}
 
-	if respJSON.Code != 3000 {
-		log.Printf("TTS service error: code=%d, message=%s", respJSON.Code, respJSON.Message)
-		return nil, fmt.Errorf("TTS service error")
+	if len(audioData) == 0 {
+		return nil, fmt.Errorf("no audio data received")
 	}
 
-	audio, err := base64.StdEncoding.DecodeString(respJSON.Data)
-	if err != nil {
-		log.Printf("base64 decode fail: %v", err)
-		return nil, err
-	}
-	return audio, nil
+	return &SynthesisResult{AudioData: audioData, ReqID: reqID}, nil
 }
 
 func validateAPIKey(r *http.Request) bool {
@@ -380,8 +455,22 @@ func openaiTTSHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if ttsConfigErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": fmt.Sprintf("TTS service configuration error: %v. Please check environment variables and restart the service.", ttsConfigErr),
+				"type":    "configuration_error",
+				"code":    "service_unavailable",
+			},
+		})
+		return
+	}
+
 	clientIP := getClientIP(r)
 	if !rateLimiter.Allow(clientIP) {
+		log.Printf("警告: 已超过IP速率限制，拒绝请求 - 客户端IP: %s", clientIP)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -394,9 +483,30 @@ func openaiTTSHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	select {
+	case concurrencySem <- struct{}{}:
+		defer func() { <-concurrencySem }()
+	default:
+		log.Printf("警告: 已达到最大并发请求数限制，拒绝请求 - 客户端IP: %s", getClientIP(r))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": "Server is busy, maximum concurrent requests reached. Please try again later.",
+				"type":    "concurrency_limit_error",
+				"code":    "max_concurrent_requests",
+			},
+		})
+		return
+	}
+
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MAX_REQUEST_BODY_SIZE))
 	if err != nil {
-		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+		if strings.Contains(err.Error(), "request body too large") {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		}
 		return
 	}
 
@@ -428,7 +538,7 @@ func openaiTTSHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ttsStart := time.Now()
-	audioData, err := synthesis(req.Input, speed)
+	result, err := synthesis(req.Input, speed)
 	duration := time.Since(ttsStart)
 
 	if err != nil {
@@ -440,9 +550,10 @@ func openaiTTSHandler(w http.ResponseWriter, r *http.Request) {
 	addRequestStats(true, duration, "")
 
 	w.Header().Set("Content-Type", "audio/wav")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(audioData)))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(result.AudioData)))
+	w.Header().Set("X-Request-Id", result.ReqID)
 	w.WriteHeader(http.StatusOK)
-	w.Write(audioData)
+	w.Write(result.AudioData)
 }
 
 func addRequestStats(success bool, responseTime time.Duration, errMsg string) {
@@ -480,7 +591,12 @@ func getMemoryInfo() map[string]interface{} {
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
+
+	if ttsConfigErr != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
 
 	apiStats.mutex.RLock()
 	totalRequests := apiStats.totalRequests
@@ -522,7 +638,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	response := map[string]interface{}{
 		"status":     status,
 		"service":    "ByteDance TTS to OpenAI API Adapter",
-		"version":    "1.1.0",
+		"version":    "2.0.0 (v3 API)",
 		"uptime":     fmt.Sprintf("%.0f seconds", time.Since(startTime).Seconds()),
 		"start_time": startTime.Format(time.RFC3339),
 		"memory":     getMemoryInfo(),
@@ -539,6 +655,8 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		},
 		"config_status": map[string]interface{}{
 			"all_required_vars_set": allEnvVarsSet,
+			"config_error":          ttsConfigErr != nil,
+			"config_error_message":  fmt.Sprintf("%v", ttsConfigErr),
 		},
 	}
 
@@ -580,8 +698,12 @@ func main() {
 
 	initAPIKeys()
 
-	if err := initTTSConfig(); err != nil {
-		log.Fatalf("配置初始化失败: %v", err)
+	ttsConfigErr = initTTSConfig()
+	if ttsConfigErr != nil {
+		log.Printf("警告: 配置初始化失败: %v", ttsConfigErr)
+		log.Printf("服务将继续运行，但TTS功能不可用，请检查环境变量配置")
+	} else {
+		log.Printf("配置初始化成功")
 	}
 
 	router := mux.NewRouter()
@@ -629,9 +751,13 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("Starting ByteDance TTS to OpenAI API adapter server on port %s", port)
+		log.Printf("Starting ByteDance TTS to OpenAI API Adapter Server")
+		log.Printf("Listening on port: %s", port)
 		log.Printf("OpenAI TTS endpoint: http://localhost:%s/v1/audio/speech", port)
 		log.Printf("Health check: http://localhost:%s/health", port)
+		log.Printf("Using ByteDance v3 API: %s", ttsConfig.URL)
+		log.Printf("Resource ID: %s", ttsConfig.ResourceId)
+		log.Printf("Speaker: %s", ttsConfig.Speaker)
 
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed to start: %v", err)
