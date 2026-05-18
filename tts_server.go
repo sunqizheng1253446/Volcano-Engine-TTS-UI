@@ -71,11 +71,14 @@ type ByteDanceTTSConfig struct {
 }
 
 type RateLimiter struct {
-	requests map[string][]time.Time
-	mutex    sync.Mutex
-	limit    int
-	window   time.Duration
+	requests    map[string][]time.Time
+	mutex       sync.Mutex
+	limit       int
+	window      time.Duration
+	lastCleanup time.Time
 }
+
+const cleanupInterval = time.Hour
 
 type Stats struct {
 	totalRequests       int64
@@ -131,6 +134,11 @@ func (rl *RateLimiter) Allow(key string) bool {
 	now := time.Now()
 	cutoff := now.Add(-rl.window)
 
+	if now.Sub(rl.lastCleanup) > cleanupInterval {
+		rl.cleanup()
+		rl.lastCleanup = now
+	}
+
 	timestamps := rl.requests[key]
 	valid := make([]time.Time, 0, len(timestamps))
 	for _, ts := range timestamps {
@@ -147,6 +155,23 @@ func (rl *RateLimiter) Allow(key string) bool {
 	valid = append(valid, now)
 	rl.requests[key] = valid
 	return true
+}
+
+func (rl *RateLimiter) cleanup() {
+	cutoff := time.Now().Add(-rl.window)
+	for k, v := range rl.requests {
+		valid := make([]time.Time, 0, len(v))
+		for _, ts := range v {
+			if ts.After(cutoff) {
+				valid = append(valid, ts)
+			}
+		}
+		if len(valid) == 0 {
+			delete(rl.requests, k)
+		} else {
+			rl.requests[k] = valid
+		}
+	}
 }
 
 func initTTSConfig() error {
@@ -242,20 +267,12 @@ func httpPostStream(url string, headers map[string]string, body []byte, timeout 
 		req.Header.Set(key, value)
 	}
 
-	client := globalHTTPClient
-	if timeout != 0 {
-		client = &http.Client{
-			Timeout: timeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     90 * time.Second,
-				TLSHandshakeTimeout: 10 * time.Second,
-			},
-		}
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 
-	return client.Do(req)
+	req = req.WithContext(ctx)
+
+	return globalHTTPClient.Do(req)
 }
 
 func convertSpeedToSpeechRate(speed float64) int {
@@ -268,7 +285,12 @@ func convertSpeedToSpeechRate(speed float64) int {
 	return int((speed - 1.0) * 100)
 }
 
-func synthesis(text string, speed float64) ([]byte, error) {
+type SynthesisResult struct {
+	AudioData []byte
+	ReqID     string
+}
+
+func synthesis(text string, speed float64) (*SynthesisResult, error) {
 	reqID := uuid.NewString()
 
 	speechRate := convertSpeedToSpeechRate(speed)
@@ -336,6 +358,8 @@ func synthesis(text string, speed float64) ([]byte, error) {
 			if v3Resp.Usage != nil {
 				log.Printf("TTS synthesis completed, usage: %+v", v3Resp.Usage)
 			}
+			for scanner.Scan() {
+			}
 			break
 		}
 
@@ -365,7 +389,7 @@ func synthesis(text string, speed float64) ([]byte, error) {
 		return nil, fmt.Errorf("no audio data received")
 	}
 
-	return audioData, nil
+	return &SynthesisResult{AudioData: audioData, ReqID: reqID}, nil
 }
 
 func validateAPIKey(r *http.Request) bool {
@@ -478,7 +502,11 @@ func openaiTTSHandler(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MAX_REQUEST_BODY_SIZE))
 	if err != nil {
-		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+		if strings.Contains(err.Error(), "request body too large") {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		}
 		return
 	}
 
@@ -510,7 +538,7 @@ func openaiTTSHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ttsStart := time.Now()
-	audioData, err := synthesis(req.Input, speed)
+	result, err := synthesis(req.Input, speed)
 	duration := time.Since(ttsStart)
 
 	if err != nil {
@@ -522,9 +550,10 @@ func openaiTTSHandler(w http.ResponseWriter, r *http.Request) {
 	addRequestStats(true, duration, "")
 
 	w.Header().Set("Content-Type", "audio/wav")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(audioData)))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(result.AudioData)))
+	w.Header().Set("X-Request-Id", result.ReqID)
 	w.WriteHeader(http.StatusOK)
-	w.Write(audioData)
+	w.Write(result.AudioData)
 }
 
 func addRequestStats(success bool, responseTime time.Duration, errMsg string) {
