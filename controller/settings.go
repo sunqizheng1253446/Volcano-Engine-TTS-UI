@@ -299,12 +299,13 @@ func SettingsAuthKeyHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // SettingsCORSRequest 是 PUT /api/settings/cors 的 body。
-// 两个字段都可选(至少给一个):
-//   - allow_all: true → 任意 Origin 都接受(*);设了之后 origins 失效
-//   - origins: 一行一个 origin,后端 trim + lower + 去末尾 /
+// 两个字段都可选(至少给一个),用指针区分"未传"和"传空串":
+//   - allow_all 指针: nil=未传(不动)  *true=开 *false=关
+//   - origins  字符串: nil=未传(不动)  ""=传空串(清空)  "url1\nurl2"=覆盖
+// 这样用户能精确表达意图(保留 / 改 / 清空),不会被 0/"" 歧义坑死。
 type SettingsCORSRequest struct {
-	AllowAll *bool  `json:"allow_all,omitempty"`
-	Origins  string `json:"origins,omitempty"` // 也接受 string 数组(任一形式)
+	AllowAll *bool   `json:"allow_all,omitempty"`
+	Origins  *string `json:"origins,omitempty"` // *string 区分"未传(nil)"和"传空串"
 }
 
 // SettingsCORSHandler PUT /api/settings/cors
@@ -327,10 +328,9 @@ func SettingsCORSHandler(w http.ResponseWriter, r *http.Request) {
 		middleware.SendJSONError(w, http.StatusBadRequest, "invalid JSON body", "invalid_request_error", "bad_request")
 		return
 	}
-	if body.AllowAll == nil && trimAll(body.Origins) == "" && body.Origins != "" {
-		// 空 body 不算错误,用户可能是想"清空"(只清 origins 保留现状)
-	}
-	if body.AllowAll == nil && body.Origins == "" {
+	// 至少要给一个字段(allow_all 或 origins)
+	// 指针为 nil 表示"未传",不计入
+	if body.AllowAll == nil && body.Origins == nil {
 		middleware.SendJSONError(w, http.StatusBadRequest,
 			"at least one of allow_all / origins required",
 			"invalid_request_error", "no_fields")
@@ -341,22 +341,27 @@ func SettingsCORSHandler(w http.ResponseWriter, r *http.Request) {
 	if body.AllowAll != nil {
 		updates["cors_allow_all"] = boolToStr(*body.AllowAll)
 	}
-	if body.Origins != "" {
-		// 校验每个 origin 至少像 http(s)://... (防止用户填空或填乱字符)
-		for _, line := range strings.Split(body.Origins, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			low := strings.ToLower(line)
-			if !strings.HasPrefix(low, "http://") && !strings.HasPrefix(low, "https://") {
-				middleware.SendJSONError(w, http.StatusBadRequest,
-					fmt.Sprintf("invalid origin: %q (must start with http:// or https://)", line),
-					"invalid_request_error", "origin_invalid")
-				return
+	if body.Origins != nil {
+		// *Origins == "" 表示用户要清空(保留 nil 表示"不动")
+		origins := *body.Origins
+		if origins != "" {
+			// 校验每个 origin 至少像 http(s)://... (防止用户填乱字符)
+			for _, line := range strings.Split(origins, "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				low := strings.ToLower(line)
+				if !strings.HasPrefix(low, "http://") && !strings.HasPrefix(low, "https://") {
+					middleware.SendJSONError(w, http.StatusBadRequest,
+						fmt.Sprintf("invalid origin: %q (must start with http:// or https://)", line),
+						"invalid_request_error", "origin_invalid")
+					return
+				}
 			}
 		}
-		updates["cors_origins"] = body.Origins
+		// 空串也能存(表示"清空");trim/lower 在 LoadRuntimeConfig 那侧做
+		updates["cors_origins"] = origins
 	}
 	if err := s.SettingsSetBatch(updates); err != nil {
 		log.Printf("[settings] cors set: %v", err)
