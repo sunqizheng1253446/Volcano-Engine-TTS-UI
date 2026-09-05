@@ -121,7 +121,7 @@ func SettingsUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	// 收集要更新的键值对
 	updates := make(map[string]string)
 	if body.DefaultResourceID != nil {
-		v := trimAll(*body.DefaultResourceID)
+		v := strings.TrimSpace(*body.DefaultResourceID)
 		if v == "" {
 			middleware.SendJSONError(w, http.StatusBadRequest, "default_resource_id cannot be empty", "invalid_request_error", "missing_field")
 			return
@@ -129,7 +129,7 @@ func SettingsUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		updates["default_resource_id"] = v
 	}
 	if body.DefaultSpeaker != nil {
-		v := trimAll(*body.DefaultSpeaker)
+		v := strings.TrimSpace(*body.DefaultSpeaker)
 		if v == "" {
 			middleware.SendJSONError(w, http.StatusBadRequest, "default_speaker cannot be empty", "invalid_request_error", "missing_field")
 			return
@@ -144,7 +144,7 @@ func SettingsUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		updates["default_speaker"] = v
 	}
 	if body.DefaultFormat != nil {
-		v := trimAll(*body.DefaultFormat)
+		v := strings.TrimSpace(*body.DefaultFormat)
 		if !isValidFormat(v) {
 			middleware.SendJSONError(w, http.StatusBadRequest,
 				fmt.Sprintf("default_format %q invalid; valid: mp3/wav/opus/pcm/aac/flac", v),
@@ -163,13 +163,13 @@ func SettingsUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		updates["sample_rate"] = strconv.Itoa(v)
 	}
 	if body.Model != nil {
-		updates["model"] = trimAll(*body.Model)
+		updates["model"] = strings.TrimSpace(*body.Model)
 	}
 	if body.ModelType != nil {
 		updates["model_type"] = strconv.Itoa(*body.ModelType)
 	}
 	if body.ExplicitLanguage != nil {
-		updates["explicit_language"] = trimAll(*body.ExplicitLanguage)
+		updates["explicit_language"] = strings.TrimSpace(*body.ExplicitLanguage)
 	}
 	if body.EnableSubtitle != nil {
 		updates["enable_subtitle"] = boolToStr(*body.EnableSubtitle)
@@ -232,7 +232,7 @@ func SettingsAPIKeyHandler(w http.ResponseWriter, r *http.Request) {
 		middleware.SendJSONError(w, http.StatusBadRequest, "invalid JSON body", "invalid_request_error", "bad_request")
 		return
 	}
-	key := trimAll(body.APIKey)
+	key := strings.TrimSpace(body.APIKey)
 	if key == "" {
 		middleware.SendJSONError(w, http.StatusBadRequest, "api_key cannot be empty", "invalid_request_error", "missing_field")
 		return
@@ -280,7 +280,7 @@ func SettingsAuthKeyHandler(w http.ResponseWriter, r *http.Request) {
 		middleware.SendJSONError(w, http.StatusBadRequest, "invalid JSON body", "invalid_request_error", "bad_request")
 		return
 	}
-	key := trimAll(body.AuthKey)
+	key := strings.TrimSpace(body.AuthKey)
 	if key == "" {
 		middleware.SendJSONError(w, http.StatusBadRequest, "auth_key cannot be empty", "invalid_request_error", "missing_field")
 		return
@@ -407,18 +407,6 @@ func maskAPIKeyField(s string) string {
 	}
 	// 仿 setting.maskAPIKey: 但这里打的是 TTS 服务用的 key,可能含字母数字和连字符
 	return s[:4] + "****" + s[len(s)-4:]
-}
-
-func trimAll(s string) string {
-	// 简单 trim 前后空白;不剥中间空格
-	out := s
-	for len(out) > 0 && (out[0] == ' ' || out[0] == '\t' || out[0] == '\n' || out[0] == '\r') {
-		out = out[1:]
-	}
-	for len(out) > 0 && (out[len(out)-1] == ' ' || out[len(out)-1] == '\t' || out[len(out)-1] == '\n' || out[len(out)-1] == '\r') {
-		out = out[:len(out)-1]
-	}
-	return out
 }
 
 func isValidFormat(s string) bool {
