@@ -232,7 +232,11 @@ func OpenaiTTSHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(result.AudioData)))
 	w.Header().Set("X-Request-Id", result.ReqID)
 	w.WriteHeader(http.StatusOK)
-	w.Write(result.AudioData)
+	if n, err := w.Write(result.AudioData); err != nil {
+		// header 已发,无法改 status code;只记日志供排查(常见:客户端中途断开 → broken pipe / connection reset)
+		log.Printf("警告: 响应写入失败 - 路径=%s 客户端=%s 已写=%d/%d 错误=%v",
+			r.URL.Path, middleware.GetClientIP(r), n, len(result.AudioData), err)
+	}
 }
 
 func classifyStatus(err error) string {
