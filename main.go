@@ -78,7 +78,7 @@ func main() {
 			log.Printf("[main][WARN] TTS 运行时配置加载失败 (setup mode, 需先 /setup): %v", err)
 		} else {
 			log.Printf("[main] TTS 运行时配置已加载(api_key=***, speaker=%s, resource=%s, format=%s)",
-				setting.TTSOptions.Speaker, setting.TTSOptions.ResourceID, setting.TTSOptions.Format)
+				telemetry.MaskSpeaker(setting.TTSOptions.Speaker), telemetry.MaskResourceID(setting.TTSOptions.ResourceID), setting.TTSOptions.Format)
 		}
 	}
 

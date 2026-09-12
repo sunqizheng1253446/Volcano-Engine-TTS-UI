@@ -449,7 +449,7 @@ func LogStartupSummary() {
 	}
 	checks := []ttsCheck{
 		{"BYTEDANCE_TTS_API_KEY", maskAPIKey(TTSOptions.APIKey), TTSOptions.APIKey != ""},
-		{"BYTEDANCE_TTS_RESOURCE_ID", TTSOptions.ResourceID, TTSOptions.ResourceID != ""},
+		{"BYTEDANCE_TTS_RESOURCE_ID", telemetry.MaskResourceID(TTSOptions.ResourceID), TTSOptions.ResourceID != ""},
 		// speaker 是火山复刻音色 ID(用户付费资产),日志里打码,避免明文落盘
 		{"BYTEDANCE_TTS_SPEAKER", telemetry.MaskSpeaker(TTSOptions.Speaker), TTSOptions.Speaker != ""},
 	}
