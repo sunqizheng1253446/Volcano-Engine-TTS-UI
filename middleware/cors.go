@@ -148,7 +148,7 @@ func CORS(next http.Handler) http.Handler {
 
 		// Origin 匹配:设置 CORS 响应头
 		w.Header().Set("Access-Control-Allow-Origin", allowOrigin)
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Expose-Headers", "X-Request-Id")
 		w.Header().Set("Access-Control-Max-Age", corsMaxAgeHeader)
